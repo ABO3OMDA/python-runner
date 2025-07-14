@@ -1,0 +1,8 @@
+new_kernel
+data
+venv
+product_time_stamp.txt
+**/__pycache__/**
+.venv/**
+.venv
+myenv
