@@ -1,12 +1,9 @@
 import sys
-import xmlrpc.client
-import base64
-import requests
 import os
 from datetime import datetime, timedelta
 from time import sleep
 
-from json2html import *
+sys.path.insert(0, 'helpers/')
 
 from helpers.file_helper import read_time_stamp, write_time_stamp
 from helpers.helpers import flatten, odooReadSearch
@@ -14,332 +11,358 @@ from helpers.odoo_connector import OdooConnector
 from helpers.product_helpers import ProductHelper
 from helpers.sql_connector import SQLConnector
 
-sys.path.insert(0, 'helpers/')
-
-def get_odoo_image_url(product_id, field_name='image_1920'):
-    """Generate Odoo public image URL - no downloading needed"""
-    import requests
-    
-    try:
-        # Generate Odoo public URL
-        if field_name == 'image_1920':
-            image_url = f"https://odoo.eboutiques.com/public/product_image/{product_id}/image_1920"
-        else:
-            # For other field names, try generic image_1
-            image_url = f"https://odoo.eboutiques.com/public/product_image/{product_id}/image_1"
-        
-        print(f"🔗 Checking Odoo image URL: {image_url}")
-        
-        # Quick check if URL exists
-        response = requests.head(image_url, timeout=5)
-        if response.status_code == 200:
-            print("✅ Odoo image URL is valid")
-            return image_url
-        else:
-            print("⚠️  Odoo image URL not available")
-            return "no_product_image.jpg"
-            
-    except Exception as e:
-        print(f"❌ Failed to check image URL for product {product_id}: {str(e)}")
-        return "no_product_image.jpg"
-
-def sync_product_updates(connector, sql_connector, helper, limit=50):
-    """Sync recent product updates from Odoo"""
-    
-    # Get timestamp for recent changes (last 24 hours or since last sync)
-    last_sync_at = read_time_stamp("product_time_stamp.txt")
-    print(f"Syncing products updated since: {last_sync_at}")
-    
-    try:
-        # Get recently updated product templates
-        product_templates = odooReadSearch(
-            connector,
-            "product.template",
-            where_clause=["write_date", ">=", last_sync_at],
-            sFields=[
-                "name",
-                "list_price", 
-                "standard_price",
-                "type",
-                "qty_available",
-                "product_tag_ids",
-                "default_code",
-                "id",
-                "write_date",
-                "weight",
-                "taxes_id",
-                "supplier_taxes_id",
-                "categ_id",
-                "image_1920",  # Main product image
-                "image_1024",  # Alternative image size  
-                "image_512",   # Smaller image size
-                "active"       # Product status
-            ],
-            limit=limit,
-            offset=0,
-        )
-        
-        print(f"📊 Found {len(product_templates)} updated product templates")
-        
-        if not product_templates:
-            print("No updated products found")
-            return
-        
-        # Get corresponding product variants
-        template_ids = [pt["id"] for pt in product_templates]
-        products = odooReadSearch(
-            connector,
-            "product.product",
-            where_clause=["product_tmpl_id", "in", template_ids],
-            sFields=[
-                "name",
-                "display_name", 
-                "code",
-                "default_code",
-                "id",
-                "product_template_variant_value_ids",
-                "product_tmpl_id",
-                "qty_available",
-                "lst_price",
-                "standard_price",
-                "weight",
-                "taxes_id",
-                "supplier_taxes_id",
-                "active",
-                "image_1920"  # Variant image
-            ],
-            limit=limit * 5,  # More variants than templates
-            offset=0,
-        )
-        
-        print(f"📦 Found {len(products)} updated product variants")
-        
-        # Get product attributes
-        all_variant_value_ids = flatten([p["product_template_variant_value_ids"] for p in products])
-        product_attr = []
-        
-        if all_variant_value_ids:
-            product_attr = odooReadSearch(
-                connector,
-                "product.template.attribute.value",
-                where_clause=["id", "in", all_variant_value_ids],
-                sFields=["id", "html_color", "name", "attribute_line_id"],
-                limit=1000,
-                offset=0,
-            )
-        
-        # Process each updated product template
-        for pt in product_templates:
-            try:
-                print(f"\n{'='*60}")
-                print(f"📦 Processing: {pt['name']}")
-                print(f"🔄 Last updated: {pt['write_date']}")
-                print(f"💰 Price: {pt['list_price']}")
-                print(f"📊 Stock: {pt['qty_available']}")
-                print(f"🏷️  Has taxes: {bool(pt.get('taxes_id'))}")
-                print(f"🖼️  Has image: {bool(pt.get('image_1920'))}")
-                print(f"🔍 Image fields: image_1920={bool(pt.get('image_1920'))}, image_1024={bool(pt.get('image_1024'))}, image_512={bool(pt.get('image_512'))}")
-                print(f"✅ Active: {pt.get('active', True)}")
-                
-                # Download product image if available (try different image fields)
-                image_path = "storage/website_images/Screenshot 2024-07-02 145345.png"  # default
-                if pt.get('image_1920'):
-                    image_path = get_odoo_image_url(pt["id"], 'image_1920')
-                elif pt.get('image_1024'):
-                    image_path = get_odoo_image_url(pt["id"], 'image_1024') 
-                elif pt.get('image_512'):
-                    image_path = get_odoo_image_url(pt["id"], 'image_512')
-                
-                # Get variants for this template
-                variants = [p for p in products if p["product_tmpl_id"][0] == pt["id"]]
-                
-                # Get attributes for these variants
-                template_attrs = []
-                for v in variants:
-                    for a in product_attr:
-                        if a["id"] in v["product_template_variant_value_ids"]:
-                            template_attrs.append(a)
-                
-                # Remove duplicates
-                template_attrs = list({a["id"]: a for a in template_attrs}.values())
-                
-                print(f"🔧 Found {len(variants)} variants with {len(template_attrs)} attributes")
-                
-                # Check if product exists in Laravel database
-                existing = sql_connector.getOne("products", f"`remote_key_id` = '{pt['id']}'").fetch()
-                if existing:
-                    print(f"🔄 Updating existing product (Laravel ID: {existing['id']})")
-                else:
-                    print(f"➕ Creating new product")
-                
-                # Process the product with enhanced data
-                enhanced_pt = pt.copy()
-                enhanced_pt['downloaded_image_path'] = image_path
-                
-                # Sync the product
-                helper.upsert_product_template(enhanced_pt, variants, template_attrs)
-                
-                print(f"✅ Successfully processed: {pt['name']}")
-                
-            except Exception as e:
-                print(f"❌ Error processing product {pt.get('name', 'Unknown')}: {str(e)}")
-                continue
-        
-        print(f"\n🎉 Sync completed! Processed {len(product_templates)} products")
-        
-    except Exception as e:
-        print(f"❌ Sync failed: {str(e)}")
-        import traceback
-        traceback.print_exc()
-
 def quick_quantity_sync(connector, sql_connector, limit=50):
-    """Quick sync for quantity changes only"""
+    """Quick sync for quantity changes only - FIXED VERSION"""
     print(f"\n🔢 Quick quantity sync...")
     
     try:
         # Get recently synced products with potential quantity changes
         synced_products = sql_connector.getAll(
             "products", 
-            "remote_key_id IS NOT NULL", 
+            "`remote_key_id` IS NOT NULL AND `remote_key_id` != ''", 
             select="id, remote_key_id, name, qty"
         ).fetch()
         
         if not synced_products:
             print("❌ No synced products found")
-            return
+            return 0
         
         print(f"📊 Found {len(synced_products)} synced products")
         
-        # Limit to first 20 for performance
-        synced_products = synced_products[:20]
-        odoo_ids = [int(p['remote_key_id']) for p in synced_products]
+        # Process in batches to avoid overwhelming the system
+        batch_size = 20
+        total_updated = 0
+        total_checked = 0
         
-        print(f"🔍 Checking quantities for products: {odoo_ids}")
-        
-        # Get current Odoo quantities (using qty_available - will check other fields later)
-        odoo_products = connector.read('product.template', odoo_ids, ['id', 'qty_available'])
-        
-        print(f"📊 Got {len(odoo_products)} products from Odoo")
-        
-        updated_count = 0
-        checked_count = 0
-        
-        for odoo_product in odoo_products:
-            laravel_product = next((p for p in synced_products if int(p['remote_key_id']) == odoo_product['id']), None)
+        for i in range(0, len(synced_products), batch_size):
+            batch = synced_products[i:i + batch_size]
+            odoo_ids = [int(p['remote_key_id']) for p in batch]
             
-            if laravel_product:
-                odoo_qty = int(odoo_product['qty_available'])
-                laravel_qty = int(laravel_product['qty'])
-                checked_count += 1
+            print(f"🔍 Checking batch {i//batch_size + 1}: {len(odoo_ids)} products")
+            
+            try:
+                # Get current Odoo quantities
+                odoo_products = connector.read('product.template', odoo_ids, ['id', 'qty_available', 'name'])
                 
-                print(f"  🔍 {laravel_product['name']}: Laravel={laravel_qty}, Odoo={odoo_qty}")
+                if not odoo_products:
+                    continue
                 
-                if odoo_qty != laravel_qty:
-                    sql_connector.update("products", f"`id` = '{laravel_product['id']}'", {"qty": odoo_qty})
-                    print(f"    🔄 UPDATED: {laravel_qty} → {odoo_qty}")
-                    updated_count += 1
-                else:
-                    print(f"    ✅ No change needed")
+                for odoo_product in odoo_products:
+                    # Find corresponding Laravel product
+                    laravel_product = next(
+                        (p for p in batch if int(p['remote_key_id']) == odoo_product['id']), 
+                        None
+                    )
+                    
+                    if laravel_product:
+                        odoo_qty = int(odoo_product.get('qty_available', 0))
+                        laravel_qty = int(laravel_product.get('qty', 0))
+                        total_checked += 1
+                        
+                        if odoo_qty != laravel_qty:
+                            print(f"  🔄 {laravel_product['name']}: Laravel={laravel_qty}, Odoo={odoo_qty}")
+                            
+                            # Update product quantity
+                            try:
+                                update_result = sql_connector.update(
+                                    "products", 
+                                    f"`id` = '{laravel_product['id']}'", 
+                                    {"qty": odoo_qty}
+                                )
+                                
+                                # Verify update was successful
+                                if update_result and update_result._results:
+                                    print(f"    ✅ UPDATED: {laravel_qty} → {odoo_qty}")
+                                    
+                                    # Also update variants for this product
+                                    update_variant_quantities(
+                                        connector, 
+                                        sql_connector, 
+                                        odoo_product['id'], 
+                                        laravel_product['id']
+                                    )
+                                    
+                                    total_updated += 1
+                                else:
+                                    print(f"    ❌ Update failed for product ID {laravel_product['id']}")
+                                    
+                            except Exception as e:
+                                print(f"    ❌ Error updating product {laravel_product['id']}: {str(e)}")
+                        else:
+                            print(f"  ✅ {laravel_product['name']}: No change (qty={laravel_qty})")
+                            
+            except Exception as e:
+                print(f"  ❌ Error processing batch: {str(e)}")
+                continue
         
-        print(f"✅ Checked {checked_count} products, updated {updated_count} quantities")
+        print(f"\n✅ Quantity sync completed: Checked {total_checked}, Updated {total_updated}")
+        return total_updated
         
     except Exception as e:
         print(f"❌ Quick quantity sync failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return 0
 
-def quick_image_sync(connector, sql_connector, helper, limit=30):
-    """Quick sync for image changes"""
-    print(f"\n🖼️  Quick image sync...")
-    
+def update_variant_quantities(connector, sql_connector, template_id, laravel_product_id):
+    """Update variant quantities for a specific product"""
     try:
-        # Get products updated in last hour
-        from datetime import datetime, timedelta
-        recent_time = (datetime.now() - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+        # Get all variants for this template
+        variant_ids = connector.search('product.product', [('product_tmpl_id', '=', template_id)])
         
-        recent_products = odooReadSearch(
-            connector,
-            "product.template", 
-            where_clause=["write_date", ">=", recent_time],
-            sFields=["id", "name", "image_1920", "write_date"],
-            limit=limit
-        )
-        
-        if not recent_products:
-            print("❌ No recently updated products")
+        if not variant_ids:
             return
         
+        # Get variant details
+        variants = connector.read('product.product', variant_ids, ['id', 'default_code', 'qty_available'])
+        
+        updated_variants = 0
+        
+        for variant in variants:
+            if variant.get('default_code'):  # Only update variants with SKU
+                try:
+                    # Update Laravel variant stock
+                    update_data = {"stock": int(variant.get('qty_available', 0))}
+                    
+                    # Update by remote_key_id if available
+                    where_clause = f"`product_id` = '{laravel_product_id}' AND `remote_key_id` = '{variant['id']}'"
+                    
+                    # First try to update by remote_key_id
+                    result = sql_connector.update("product_variants", where_clause, update_data)
+                    
+                    # If no rows affected, try by SKU
+                    if not result or not result._results:
+                        where_clause = f"`product_id` = '{laravel_product_id}' AND `sku` = '{variant['default_code']}'"
+                        result = sql_connector.update("product_variants", where_clause, update_data)
+                    
+                    if result and result._results:
+                        updated_variants += 1
+                        print(f"      ✅ Updated variant {variant['default_code']}: stock={variant['qty_available']}")
+                        
+                except Exception as e:
+                    print(f"      ⚠️ Failed to update variant {variant.get('default_code', 'unknown')}: {str(e)}")
+        
+        if updated_variants > 0:
+            print(f"    📦 Updated {updated_variants} variants")
+            
+    except Exception as e:
+        print(f"    ⚠️ Variant quantity update failed for template {template_id}: {str(e)}")
+
+def detect_quantity_changes_enhanced(connector, sql_connector, limit=100):
+    """Enhanced quantity change detection with better error handling"""
+    print("\n🔢 Enhanced quantity change detection...")
+    
+    try:
+        # Get products that need quantity checks
+        # Focus on products with non-zero quantities first (more likely to change)
+        synced_products = sql_connector.getAll(
+            "products", 
+            "`remote_key_id` IS NOT NULL AND `remote_key_id` != '' AND `qty` > 0",
+            select="id, remote_key_id, name, qty, updated_at"
+        ).fetch()
+        
+        if not synced_products:
+            print("❌ No synced products with stock found")
+            return 0
+        
+        # Sort by last update to prioritize recently changed products
+        synced_products.sort(key=lambda x: x.get('updated_at', ''), reverse=True)
+        
+        # Limit to most recent products
+        synced_products = synced_products[:limit]
+        
+        print(f"📊 Checking {len(synced_products)} products for quantity changes")
+        
         updated_count = 0
-        for product in recent_products:
+        errors_count = 0
+        
+        # Process in smaller batches for better reliability
+        batch_size = 10
+        
+        for i in range(0, len(synced_products), batch_size):
+            batch = synced_products[i:i + batch_size]
+            batch_ids = [int(p['remote_key_id']) for p in batch]
+            
             try:
-                # Check if exists in Laravel
-                laravel_product = sql_connector.getOne("products", f"`remote_key_id` = '{product['id']}'").fetch()
-                if not laravel_product:
+                # Get Odoo data with retry logic
+                odoo_data = None
+                for attempt in range(3):
+                    try:
+                        odoo_data = connector.read(
+                            'product.template',
+                            batch_ids,
+                            ['id', 'qty_available', 'name', 'write_date']
+                        )
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            print(f"  ⚠️ Retry {attempt + 1}/3 for batch read...")
+                            sleep(1)
+                        else:
+                            raise
+                
+                if not odoo_data:
                     continue
                 
-                # Check main image
-                if product.get('image_1920'):
-                    new_url = f"https://odoo.eboutiques.com/public/product_image/{product['id']}/image_1920"
-                    current_url = laravel_product.get('thumb_image', '')
+                for odoo_product in odoo_data:
+                    laravel_product = next(
+                        (p for p in batch if int(p['remote_key_id']) == odoo_product['id']),
+                        None
+                    )
                     
-                    if new_url != current_url:
-                        # Quick URL validation
-                        import requests
-                        try:
-                            response = requests.head(new_url, timeout=3)
-                            if response.status_code == 200:
-                                sql_connector.update("products", f"`id` = '{laravel_product['id']}'", {"thumb_image": new_url})
-                                print(f"  🔄 Updated image: {product['name']}")
-                                updated_count += 1
-                        except:
-                            pass  # Skip if URL check fails
-                
-                # Quick gallery resync
-                helper.sync_product_gallery(product['id'], laravel_product['id'])
-                
+                    if laravel_product:
+                        odoo_qty = int(odoo_product.get('qty_available', 0))
+                        laravel_qty = int(laravel_product.get('qty', 0))
+                        
+                        if odoo_qty != laravel_qty:
+                            print(f"\n🔄 Quantity change detected:")
+                            print(f"   Product: {laravel_product['name']}")
+                            print(f"   Laravel: {laravel_qty} → Odoo: {odoo_qty}")
+                            print(f"   Last Odoo update: {odoo_product.get('write_date', 'Unknown')}")
+                            
+                            # Perform the update with verification
+                            try:
+                                # Update with explicit commit
+                                with sql_connector.get_connection() as conn:
+                                    with conn.cursor() as cursor:
+                                        update_sql = f"""
+                                        UPDATE products 
+                                        SET qty = {odoo_qty}, 
+                                            updated_at = NOW() 
+                                        WHERE id = {laravel_product['id']}
+                                        """
+                                        cursor.execute(update_sql)
+                                        conn.commit()
+                                        
+                                        # Verify the update
+                                        cursor.execute(
+                                            f"SELECT qty FROM products WHERE id = {laravel_product['id']}"
+                                        )
+                                        result = cursor.fetchone()
+                                        
+                                        if result and result['qty'] == odoo_qty:
+                                            print(f"   ✅ Successfully updated to {odoo_qty}")
+                                            updated_count += 1
+                                            
+                                            # Update variants too
+                                            update_variant_quantities(
+                                                connector,
+                                                sql_connector,
+                                                odoo_product['id'],
+                                                laravel_product['id']
+                                            )
+                                        else:
+                                            print(f"   ❌ Update verification failed")
+                                            errors_count += 1
+                                            
+                            except Exception as e:
+                                print(f"   ❌ Update failed: {str(e)}")
+                                errors_count += 1
+                                
             except Exception as e:
-                print(f"  ⚠️  Error syncing {product.get('name', 'unknown')}: {str(e)}")
+                print(f"  ❌ Batch processing error: {str(e)}")
+                errors_count += len(batch)
                 continue
         
-        print(f"✅ Updated {updated_count} product images")
+        print(f"\n🎉 Enhanced quantity sync completed:")
+        print(f"   ✅ Updated: {updated_count} products")
+        print(f"   ❌ Errors: {errors_count}")
+        
+        return updated_count
         
     except Exception as e:
-        print(f"❌ Quick image sync failed: {str(e)}")
+        print(f"❌ Enhanced quantity detection failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return 0
 
-def __product_service_runner__():
-    """Enhanced product service runner with update detection"""
-    print("🚀 Starting enhanced product sync with updates, images, and quantities...")
+def verify_database_connection(sql_connector):
+    """Verify database connection is working properly"""
+    try:
+        # Test simple query
+        result = sql_connector.getOne("products", "1=1 LIMIT 1").fetch()
+        if result:
+            print(f"✅ Database connection verified")
+            return True
+        else:
+            print(f"⚠️ Database empty or connection issue")
+            return False
+    except Exception as e:
+        print(f"❌ Database connection failed: {str(e)}")
+        return False
+
+def enhanced_product_sync_runner():
+    """Enhanced product sync with better quantity change detection"""
+    print("🚀 Starting enhanced product sync with improved quantity updates...")
     
     try:
         connector = OdooConnector()
         sql_connector = SQLConnector()
         helper = ProductHelper(connector, sql_connector)
         
-        # Run migrations to ensure latest database structure
+        # Verify database connection first
+        if not verify_database_connection(sql_connector):
+            print("❌ Database connection issue - retrying in 60 seconds...")
+            sleep(60)
+            return enhanced_product_sync_runner()
+        
+        # Run migrations
         print("🔧 Running database migrations...")
         sql_connector.migrate()
         
-        # 1. Sync recent updates
-        sync_product_updates(connector, sql_connector, helper, limit=20)
+        # 1. Regular product sync (for new products and major changes)
+        print("\n" + "="*60)
+        print("1️⃣ REGULAR PRODUCT SYNC")
+        print("="*60)
         
-        # 2. Quick quantity sync (every run)
-        quick_quantity_sync(connector, sql_connector, limit=50)
+        from product_service_runner import sync_product_updates
+        sync_product_updates(connector, sql_connector, helper, limit=10)
         
-        # 3. Image change detection (every run)
-        quick_image_sync(connector, sql_connector, helper, limit=30)
+        # 2. Enhanced quantity change detection
+        print("\n" + "="*60)
+        print("2️⃣ ENHANCED QUANTITY CHANGE DETECTION")
+        print("="*60)
         
-        # Update timestamp for next run
+        qty_updates = detect_quantity_changes_enhanced(connector, sql_connector, limit=50)
+        
+        # 3. Quick quantity sync for remaining products
+        print("\n" + "="*60)
+        print("3️⃣ QUICK QUANTITY SYNC")
+        print("="*60)
+        
+        quick_updates = quick_quantity_sync(connector, sql_connector, limit=100)
+        
+        # 4. Image change detection (less frequent)
+        if datetime.now().minute % 5 == 0:  # Run every 5 minutes
+            print("\n" + "="*60)
+            print("4️⃣ IMAGE CHANGE DETECTION")
+            print("="*60)
+            
+            from enhanced_product_sync import detect_image_changes
+            img_updates = detect_image_changes(connector, sql_connector, helper, limit=20)
+        else:
+            img_updates = 0
+        
+        # Update timestamp
         write_time_stamp("product_time_stamp.txt")
-        print("📝 Updated sync timestamp")
+        
+        print(f"\n🎉 SYNC SUMMARY:")
+        print(f"   - Enhanced quantity updates: {qty_updates}")
+        print(f"   - Quick quantity updates: {quick_updates}")
+        print(f"   - Image updates: {img_updates}")
+        print(f"   - Total quantity updates: {qty_updates + quick_updates}")
+        print(f"   - Next sync in 30 seconds...")
         
     except Exception as e:
-        print(f"❌ Service runner failed: {str(e)}")
+        print(f"❌ Enhanced sync failed: {str(e)}")
         import traceback
         traceback.print_exc()
     
-    print("😴 Sleeping for 30 seconds before next sync...")
+    print("😴 Sleeping for 30 seconds...")
     sleep(30)
     
     # Recursive call for continuous sync
-    __product_service_runner__()
+    enhanced_product_sync_runner()
 
 if __name__ == "__main__":
-    __product_service_runner__()
+    enhanced_product_sync_runner()
