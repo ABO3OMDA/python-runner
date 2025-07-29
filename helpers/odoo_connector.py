@@ -48,6 +48,14 @@ class OdooConnector:
     def get_model_fields(self, model):
         return self.models.execute_kw(self.db, self.uid, self.password, model, 'fields_get', [], {'attributes': ['string']})
 
+    def search_read(self, model, domain, fields, offset=0, limit=0):
+        """Search and read records in one call"""
+        return self.models.execute_kw(self.db, self.uid, self.password, model, 'search_read', [domain], {
+            'fields': fields,
+            'offset': offset,
+            'limit': limit
+        })
+
     def get_model_domain(self, model):
         return self.models.execute_kw(self.db, self.uid, self.password, model, 'fields_get', [], {'attributes': ['domain']})
 
